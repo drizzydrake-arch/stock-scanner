@@ -1000,6 +1000,177 @@ def run_accuracy(text, sample=400, cost_pct=0.2):
     post(embeds=[{"title": "📊 Strategy accuracy test", "description": desc[:4000], "color": col}])
 
 
+# ------------------------ TRADE JOURNAL (live accuracy) ------------------------
+LOG_FILE = "trades_log.csv"
+LOG_COLS = ["date", "ticker", "direction", "entry", "stop", "target", "grade", "score", "status",
+            "exit_date", "exit_price", "r", "pct", "days"]
+
+
+def _day(ts):
+    try:
+        return pd.Timestamp(ts).tz_localize(None).normalize()
+    except TypeError:
+        return pd.Timestamp(ts).normalize()
+
+
+def load_log():
+    try:
+        return pd.read_csv(LOG_FILE, dtype={"ticker": str, "status": str, "date": str, "exit_date": str,
+                                            "grade": str, "direction": str})
+    except Exception:
+        return pd.DataFrame(columns=LOG_COLS)
+
+
+def log_signals(results, day):
+    """Remember every trade the bot recommends so its real accuracy can be measured later."""
+    if not results:
+        return
+    log = load_log()
+    have = set(zip(log["date"].astype(str), log["ticker"]))
+    rows = []
+    for r in results:
+        if (day, r["ticker"]) in have:
+            continue
+        rows.append(dict(date=day, ticker=r["ticker"], direction=r["direction"], entry=round(r["price"], 4),
+                         stop=round(r["stop"], 4), target=round(r["target"], 4), grade=r["grade"],
+                         score=round(r["score"]), status="open", exit_date="", exit_price="", r="", pct="",
+                         days=""))
+    if rows:
+        log = pd.concat([log, pd.DataFrame(rows)], ignore_index=True)
+        log[LOG_COLS].to_csv(LOG_FILE, index=False)
+
+
+def eval_trade(row, x):
+    """Walk forward bar by bar after the signal day. Returns (exit_date, exit_price, R, bars) or None if open."""
+    buy = row["direction"] == "BUY"
+    entry, stop, target = float(row["entry"]), float(row["stop"]), float(row["target"])
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    start = _day(row["date"])
+    n = 0
+    for i in range(1, len(x)):
+        d = _day(x.index[i])
+        if d <= start:
+            continue
+        n += 1
+        o, h, l, cl = (float(x[k].iloc[i]) for k in ("o", "h", "l", "c"))
+        macd_dn = x["macd"].iloc[i] < x["sig"].iloc[i] and x["macd"].iloc[i - 1] >= x["sig"].iloc[i - 1]
+        macd_up = x["macd"].iloc[i] > x["sig"].iloc[i] and x["macd"].iloc[i - 1] <= x["sig"].iloc[i - 1]
+        ext = None
+        if buy:
+            if o <= stop:
+                ext = o                      # gapped through the stop: worse than planned
+            elif l <= stop:
+                ext = stop
+            elif o >= target:
+                ext = o
+            elif h >= target:
+                ext = target
+            elif macd_dn or cl < x["ema_t"].iloc[i]:
+                ext = cl
+            r = None if ext is None else (ext - entry) / risk
+        else:
+            if o >= stop:
+                ext = o
+            elif h >= stop:
+                ext = stop
+            elif o <= target:
+                ext = o
+            elif l <= target:
+                ext = target
+            elif macd_up or cl > x["ema_t"].iloc[i]:
+                ext = cl
+            r = None if ext is None else (entry - ext) / risk
+        if ext is not None:
+            return d, ext, r, n
+    return None
+
+
+def update_log():
+    """Check every open trade against the newest prices. Returns the list of trades that closed this run."""
+    log = load_log()
+    if log.empty:
+        return log, []
+    opened = log[log["status"] == "open"]
+    closed_now = []
+    if len(opened):
+        tick = sorted(set(opened["ticker"]))
+        data = {}
+        for k in range(0, len(tick), CFG["chunk"]):
+            data.update(split_frames(download_chunk(tick[k:k + CFG["chunk"]]), tick[k:k + CFG["chunk"]]))
+        for idx, row in opened.iterrows():
+            df = data.get(row["ticker"])
+            if df is None:
+                continue
+            try:
+                res = eval_trade(row, build(df))
+            except Exception:
+                continue
+            if res is None:
+                continue
+            d, ext, r, n = res
+            ent = float(row["entry"])
+            pct = (ext / ent - 1) * 100 * (1 if row["direction"] == "BUY" else -1)
+            log.loc[idx, ["status", "exit_date", "exit_price", "r", "pct", "days"]] = [
+                "win" if r > 0 else "loss", str(d.date()), round(ext, 4), round(r, 3), round(pct, 2), n]
+            closed_now.append((row["ticker"], r, pct))
+    log[LOG_COLS].to_csv(LOG_FILE, index=False)
+    return log, closed_now
+
+
+def record_embed(log, closed_now):
+    done = log[log["status"].isin(["win", "loss"])].copy()
+    openn = log[log["status"] == "open"]
+    for col in ("r", "pct", "days"):
+        done[col] = pd.to_numeric(done[col], errors="coerce")
+    lines = []
+    if closed_now:
+        lines.append("**Closed since the last check:**")
+        for tk, r, p in closed_now[:10]:
+            lines.append(f"{'✅' if r > 0 else '❌'} {tk}: {p:+.1f}% ({r:+.2f}R)")
+        lines.append("")
+    n = len(done)
+    if n == 0:
+        lines.append("No trade has finished yet, so there is no accuracy number yet. Every trade the bot "
+                     "recommends is saved and checked each day until it hits its stop or target.")
+    else:
+        w = int((done["r"] > 0).sum())
+        total_pct = done["pct"].sum()
+        gw, gl = done.loc[done["r"] > 0, "r"].sum(), abs(done.loc[done["r"] <= 0, "r"].sum())
+        pf = "no losses yet" if gl == 0 else f"{gw / gl:.2f}"
+        lines += [f"**Finished trades:** {n}  ({w} won, {n - w} lost)",
+                  f"**Accuracy (win rate):** **{w / n * 100:.0f}%**  *(need about 33% to break even)*",
+                  f"**Average trade:** {done['pct'].mean():+.2f}% ({done['r'].mean():+.2f}R)",
+                  f"**Average time in a trade:** {done['days'].mean():.0f} trading days",
+                  f"**Profit factor:** {pf}",
+                  f"**Total if you risked 1% each time:** {done['r'].sum():+.1f}% of your account"]
+        grades = []
+        for g in ("A", "B", "C"):
+            sub = done[done["grade"] == g]
+            if len(sub):
+                grades.append(f"{g}: {(sub['r'] > 0).mean() * 100:.0f}% won ({len(sub)})")
+        if grades:
+            lines.append("**By grade:** " + "   ".join(grades))
+        if n < 30:
+            lines.append(f"\n⚠️ Only {n} finished trades. Wait for 30 or more (usually a few weeks to months) "
+                         f"before trusting these percentages.")
+    if len(openn):
+        lines.append(f"\n**Still open:** {len(openn)} trade(s): " + ", ".join(openn["ticker"].head(15)))
+    color = BLUE if n < 30 else (GREEN if done["r"].mean() > 0 else RED)
+    return {"title": "📒 The bot's real track record", "description": "\n".join(lines)[:4000], "color": color}
+
+
+def run_record():
+    log, closed = update_log()
+    if log.empty:
+        post(embeds=[{"title": "📒 The bot's real track record", "color": BLUE,
+                      "description": "Nothing recorded yet. From now on, every trade the daily scan recommends "
+                                     "is saved here and followed until it hits its stop or target."}])
+        return
+    post(embeds=[record_embed(log, closed)])
+
+
 def main():
     c = CFG
     if "--glossary" in sys.argv:
@@ -1008,6 +1179,10 @@ def main():
 
     if "--selftest" in sys.argv:
         run_selftest()
+        return
+
+    if "--record" in sys.argv or os.getenv("RECORD", "").strip().lower() in ("true", "1", "yes"):
+        run_record()
         return
 
     if "--accuracy" in sys.argv or os.getenv("ACCURACY", "").strip().lower() not in ("", "false", "0"):
@@ -1110,7 +1285,7 @@ def main():
             continue
         target = price + c["rr"] * risk if direction == "BUY" else price - c["rr"] * risk
         results.append(dict(
-            ticker=t, direction=direction, price=price, stop=stop, target=target, risk=risk,
+            date=str(_day(last.name).date()), ticker=t, direction=direction, price=price, stop=stop, target=target, risk=risk,
             shares=shares, score=total, grade=grade, stats=stats, slope=float(last["slope"]),
             vol_ratio=float(last["vol_ratio"]), spy=spy, earn_days=ed,
             rsi=float(last["rsi"]), dollar_vol=float(last["dollar_vol"]), order_pct=order_pct,
@@ -1163,6 +1338,16 @@ def main():
     if watch_mode:
         rows = [f"• **{t}**: {st[t]}" for t in watch][:60]
         post(embeds=[{"title": "📋 Your watchlist today", "description": "\n".join(rows)[:4000], "color": BLUE}])
+
+    # ---- real accuracy: save today's recommendations, then check every older one against new prices
+    try:
+        if not partial:
+            log_signals(results, results[0]["date"] if results else "")
+        log, closed_now = update_log()
+        if not log.empty:
+            post(embeds=[record_embed(log, closed_now)])
+    except Exception as e:
+        print(f"(trade journal skipped: {type(e).__name__}: {e})")
 
     if results:
         os.makedirs("results", exist_ok=True)
