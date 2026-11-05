@@ -194,7 +194,7 @@ def backtest(x, allow_shorts=False):
     sl_, ss_ = x["stop_long"].values, x["stop_short"].values
 
     pos, entry, stop, tgt, risk, last_exit = 0, 0.0, 0.0, 0.0, 0.0, -999
-    results = []
+    results, trades = [], []
     for i in range(60, n):
         if pos != 0:
             r = None
@@ -214,6 +214,7 @@ def backtest(x, allow_shorts=False):
                     r = (entry - cl[i]) / risk
             if r is not None:
                 results.append(r)
+                trades.append((x.index[i], r, risk / entry))
                 pos, last_exit = 0, i
                 continue
         if pos == 0 and i - last_exit > c["cooldown"]:
@@ -227,7 +228,7 @@ def backtest(x, allow_shorts=False):
                 tgt = entry - c["rr"] * risk
     m = len(results)
     wins = sum(1 for r in results if r > 0)
-    return dict(n=m, wins=wins, avg_r=float(np.mean(results)) if m else 0.0)
+    return dict(n=m, wins=wins, avg_r=float(np.mean(results)) if m else 0.0, trades=trades)
 
 
 def score_trade(last, direction, stats, spy):
@@ -894,6 +895,111 @@ def run_selftest():
 
 
 # --------------------------------- MAIN ---------------------------------
+def accuracy_stats(trades, cost_pct):
+    """trades: list of (date, R, risk as fraction of price). Returns plain numbers for the report."""
+    if not trades:
+        return None
+    trades = sorted(trades, key=lambda z: z[0])
+    R = np.array([z[1] for z in trades])
+    frac = np.array([z[2] for z in trades])
+    pct = R * frac * 100                      # % move of the stock per trade
+    costR = (cost_pct / 100) / frac           # trading cost expressed in R
+    Rn = R - costR
+    wins, losses = R[R > 0], R[R <= 0]
+    pf = float(wins.sum() / abs(losses.sum())) if len(losses) and losses.sum() != 0 else float("inf")
+    streak = best = 0
+    for r in R:
+        streak = streak + 1 if r <= 0 else 0
+        best = max(best, streak)
+    eq = np.cumsum(Rn) * 1.0                  # in R; 1% risk per trade means 1R = 1% of account
+    dd = float(np.max(np.maximum.accumulate(np.concatenate([[0], eq]))[1:] - eq)) if len(eq) else 0.0
+    by_year = {}
+    for d, r in zip([z[0] for z in trades], R):
+        by_year.setdefault(pd.Timestamp(d).year, []).append(r)
+    return dict(n=len(R), win=float((R > 0).mean() * 100), avg_r=float(R.mean()), avg_r_net=float(Rn.mean()),
+                avg_pct=float(pct.mean()), med_pct=float(np.median(pct)), pf=pf, streak=best,
+                best=float(pct.max()), worst=float(pct.min()), total_r_net=float(Rn.sum()), dd_r=dd,
+                years={y: (len(v), float(np.mean([q > 0 for q in v]) * 100), float(np.mean(v)))
+                       for y, v in sorted(by_year.items())},
+                be_win=100.0 / (1.0 + CFG["rr"]))
+
+
+def run_accuracy(text, sample=400, cost_pct=0.2):
+    """Replay the strategy over about 5 years on many stocks and report how often it worked, in percent."""
+    c = CFG
+    old = c["history_period"]
+    c["history_period"] = "5y"
+    named = tokens(text)
+    try:
+        if named:
+            pool = named[:100]
+            label = f"{len(pool)} stock(s) you named"
+        else:
+            uni = [t for t in get_universe()]
+            rng = np.random.default_rng(7)
+            pool = list(rng.permutation(uni)[:sample]) if len(uni) > sample else uni
+            label = f"{len(pool)} randomly chosen US stocks"
+        print(f"Accuracy test on {label}...")
+        trades, tested, bars = [], 0, 0
+        for k in range(0, len(pool), c["chunk"]):
+            chunk = pool[k:k + c["chunk"]]
+            for t, df in split_frames(download_chunk(chunk), chunk).items():
+                try:
+                    x = build(df)
+                    last = x.iloc[-1]
+                    if not (last["c"] >= c["min_price"] and last["vol_avg"] >= c["min_avg_volume"]) and not named:
+                        continue
+                    tested += 1
+                    bars += len(x)
+                    trades += backtest(x)["trades"]
+                except Exception:
+                    continue
+        spy_ret = None
+        try:
+            sp = yf.Ticker("SPY").history(period="5y", interval="1d", auto_adjust=True)["Close"]
+            spy_ret = float((sp.iloc[-1] / sp.iloc[0] - 1) * 100)
+        except Exception:
+            pass
+    finally:
+        c["history_period"] = old
+
+    s = accuracy_stats(trades, cost_pct)
+    if not s or s["n"] < 20:
+        post(embeds=[{"title": "📊 Accuracy test", "color": YELLOW,
+                      "description": f"Only {0 if not s else s['n']} past trades were found on {tested} stocks. "
+                                     f"That is too few to say anything. Try again with no tickers (tests a big "
+                                     f"random sample) or name more stocks."}])
+        return
+    if s["avg_r_net"] > 0.15 and s["n"] >= 100:
+        verdict, col = "🟢 Positive edge in the past (after costs)", GREEN
+    elif s["avg_r_net"] > 0:
+        verdict, col = "🟡 Slightly positive, but too small to trust", YELLOW
+    else:
+        verdict, col = "🔴 No edge in the past (loses money after costs)", RED
+    yrs = "\n".join(f"• {y}: {n} trades, {w:.0f}% won, average {r:+.2f}R" for y, (n, w, r) in s["years"].items())
+    pf = "no losing trades" if s["pf"] == float("inf") else f"{s['pf']:.2f}"
+    desc = (
+        f"**{verdict}**\n"
+        f"Tested {tested} stocks over about 5 years: **{s['n']} past trades**.\n\n"
+        f"**How often it won:** {s['win']:.0f}% of trades\n"
+        f"*(with a {c['rr']:.0f}-to-1 target you only need {s['be_win']:.0f}% to break even)*\n\n"
+        f"**Average trade:** {s['avg_pct']:+.2f}% on the stock ({s['avg_r']:+.2f}R), "
+        f"{s['avg_r_net']:+.2f}R after a {cost_pct}% cost per trade\n"
+        f"**Typical (median) trade:** {s['med_pct']:+.2f}%\n"
+        f"**Best / worst trade:** {s['best']:+.1f}% / {s['worst']:+.1f}%\n"
+        f"**Profit factor:** {pf} *(above 1.0 means winners beat losers; above 1.3 is decent)*\n"
+        f"**Longest losing streak:** {s['streak']} trades in a row\n\n"
+        f"**Rough account result** if you risked 1% per trade, one at a time: "
+        f"**{s['total_r_net']:+.0f}%** in total, worst dip about **-{s['dd_r']:.0f}%**\n"
+        + (f"For comparison, just holding SPY for the same 5 years: {spy_ret:+.0f}%\n" if spy_ret is not None else "")
+        + f"\n**Year by year** (does it hold up?):\n{yrs}\n\n"
+        f"⚠️ **Read this:** this is the strategy replayed on the past. It ignores the market-trend and earnings "
+        f"filters, uses today's stock list (companies that failed are missing, which flatters results), and real "
+        f"trading has slippage. Treat the numbers as an upper estimate, and paper trade before using real money. "
+        f"Not financial advice.")
+    post(embeds=[{"title": "📊 Strategy accuracy test", "description": desc[:4000], "color": col}])
+
+
 def main():
     c = CFG
     if "--glossary" in sys.argv:
@@ -902,6 +1008,12 @@ def main():
 
     if "--selftest" in sys.argv:
         run_selftest()
+        return
+
+    if "--accuracy" in sys.argv or os.getenv("ACCURACY", "").strip().lower() not in ("", "false", "0"):
+        extra = os.getenv("ACCURACY", "")
+        extra = "" if extra.strip().lower() in ("true", "1", "yes", "y", "all", "test", "random") else extra
+        run_accuracy(extra + " " + " ".join(cli_args("--accuracy")))
         return
 
     # ---- commands (laptop: python scanner.py --analyze NVDA | --news NVDA | --add AAPL | --remove AAPL;
