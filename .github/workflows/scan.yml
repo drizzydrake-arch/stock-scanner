@@ -34,7 +34,7 @@ on:
         type: boolean
         default: false
       compare:
-        description: "STRATEGY LAB: type yes to test 13 possible improvements side by side (takes 10 to 20 minutes)"
+        description: "STRATEGY LAB: type yes to test tweaks AND different strategy types side by side (10 to 25 minutes)"
         type: string
         default: ""
       accuracy:
