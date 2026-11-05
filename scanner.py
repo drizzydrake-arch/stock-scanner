@@ -873,6 +873,13 @@ def run_selftest():
     else:
         add("ok", "Paper trading", "off (optional: add the two ALPACA secrets to turn it on)")
 
+    try:
+        ov = split_frames(download_chunk(["SPY", "^VIX", "XLK", "QQQ"]), ["SPY", "^VIX", "XLK", "QQQ"])
+        add("ok" if len(ov) >= 4 and index_view(ov["SPY"]) else "warn", "Market overview data",
+            f"{len(ov)} of 4 index and fear-gauge series downloaded")
+    except Exception as e:
+        add("warn", "Market overview data", f"download failed ({type(e).__name__})")
+
     wl = load_tickers(WATCH_FILE)
     add("ok", "Watchlist", f"{len(wl)} stock(s) on your watchlist" if wl else "empty (add stocks with the Run "
                                                                               "workflow form)")
@@ -1503,6 +1510,400 @@ def paper_trade(results):
                   "description": ("Orders go in before the next market open.\n" + "\n".join(lines))[:4000]}])
 
 
+# ------------------------ MARKET OVERVIEW (daily / weekly / monthly) ------------------------
+OV_INDEX = {"SPY": "S&P 500", "QQQ": "Nasdaq 100", "IWM": "Small companies", "DIA": "Dow Jones"}
+OV_SECTORS = {"XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Health care",
+              "XLY": "Consumer discretionary", "XLP": "Consumer staples", "XLI": "Industrials",
+              "XLU": "Utilities", "XLB": "Materials", "XLRE": "Real estate", "XLC": "Communication"}
+OV_HORIZON = {"daily": (1, "today", "Daily"), "weekly": (5, "this week", "Weekly"), "monthly": (21, "this month", "Monthly")}
+
+
+def _pc(a, b):
+    return (a / b - 1) * 100
+
+
+def index_view(df):
+    """Trend facts for one index ETF on the daily, weekly and monthly charts."""
+    c = df["Close"].dropna().astype(float)
+    if len(c) < 210:
+        return None
+    last = float(c.iloc[-1])
+    e20, e50 = float(ema(c, 20).iloc[-1]), float(ema(c, 50).iloc[-1])
+    s200 = float(c.tail(200).mean())
+    hi52, lo52 = float(c.tail(252).max()), float(c.tail(252).min())
+    lows = df["Low"].astype(float).dropna()
+    highs = df["High"].astype(float).dropna()
+    daily = ("UP" if last > s200 and e50 > s200 and last > e50 else
+             "DOWN" if last < s200 and e50 < s200 and last < e50 else "MIXED")
+    w = c.copy()
+    w.index = _naive(w.index)
+    wk = w.resample("W-FRI").last().dropna()
+    w10, w30 = ema(wk, 10), ema(wk, 30)
+    weekly = ("UP" if wk.iloc[-1] > w10.iloc[-1] and w10.iloc[-1] > w30.iloc[-1] else
+              "DOWN" if wk.iloc[-1] < w10.iloc[-1] and w10.iloc[-1] < w30.iloc[-1] else "MIXED")
+    try:
+        mo = w.resample("ME").last().dropna()
+    except Exception:
+        mo = w.resample("M").last().dropna()
+    monthly = "MIXED" if len(mo) < 10 else ("UP" if mo.iloc[-1] > mo.tail(10).mean() else "DOWN")
+    return dict(last=last, d1=_pc(last, float(c.iloc[-2])), d5=_pc(last, float(c.iloc[-6])),
+                d21=_pc(last, float(c.iloc[-22])), e20=e20, e50=e50, s200=s200,
+                vs50=_pc(last, e50), vs200=_pc(last, s200), hi52=hi52, lo52=lo52, dd=_pc(last, hi52),
+                rsi=float(_rsi_n(c, 14).iloc[-1]), daily=daily, weekly=weekly, monthly=monthly,
+                swing_lo=float(lows.tail(20).min()), swing_hi=float(highs.tail(20).max()),
+                low5=float(lows.tail(5).min()), low_prev=float(lows.iloc[-15:-5].min()),
+                high5=float(highs.tail(5).max()), high_prev=float(highs.iloc[-15:-5].max()))
+
+
+def vix_view(df):
+    try:
+        c = df["Close"].dropna().astype(float)
+        return dict(last=float(c.iloc[-1]), chg5=float(c.iloc[-1] - c.iloc[-6]), hi10=float(c.tail(10).max()))
+    except Exception:
+        return None
+
+
+def ov_universe():
+    """Light metrics for every liquid US stock, plus market breadth."""
+    c = CFG
+    uni = get_universe()
+    rows = []
+    br = dict(n=0, a50=0, a200=0, hi=0, lo=0, adv=0, dec=0)
+    for k in range(0, len(uni), c["chunk"]):
+        chunk = uni[k:k + c["chunk"]]
+        for tk, df in split_frames(download_chunk(chunk), chunk).items():
+            try:
+                d = df.dropna(subset=["Close"])
+                if len(d) < 210:
+                    continue
+                cl = d["Close"].values.astype(float)
+                v = d["Volume"].fillna(0).values.astype(float)
+                price = cl[-1]
+                dv = float(np.mean(cl[-20:] * v[-20:]))
+                if price < c["min_price"] or dv < c["min_dollar_volume"]:
+                    continue
+                s50, s200 = cl[-50:].mean(), cl[-200:].mean()
+                e50 = float(pd.Series(cl[-200:]).ewm(span=50, adjust=False).mean().iloc[-1])
+                hi52, lo52 = cl[-252:].max(), cl[-252:].min()
+                prior_hi = cl[-253:-1].max()
+                prior_lo = cl[-253:-1].min()
+                m1 = cl[-22] / cl[-127] - 1
+                m2 = cl[-22] / cl[-253] - 1 if len(cl) >= 253 else np.nan
+                rows.append(dict(
+                    t=tk, price=float(price), dv=dv, s50=s50, s200=s200, e50=e50, hi52=hi52,
+                    r1=_pc(price, cl[-2]), r5=_pc(price, cl[-6]), r21=_pc(price, cl[-22]),
+                    r63=_pc(price, cl[-64]), mom=float(np.nanmean([m1, m2]) * 100),
+                    prox=float(price / hi52), rsi=float(_rsi_n(pd.Series(cl[-120:]), 14).iloc[-1])))
+                br["n"] += 1
+                br["a50"] += int(price > s50)
+                br["a200"] += int(price > s200)
+                br["hi"] += int(price >= prior_hi)
+                br["lo"] += int(price <= prior_lo)
+                br["adv"] += int(price > cl[-2])
+                br["dec"] += int(price < cl[-2])
+            except Exception:
+                continue
+        if (k // c["chunk"]) % 10 == 0:
+            print(f"  ...overview {min(k + c['chunk'], len(uni))}/{len(uni)}")
+    return pd.DataFrame(rows), br
+
+
+def regime_score(spy, vix, br):
+    s = 0
+    s += 1 if spy["last"] > spy["s200"] else -1
+    s += 1 if spy["last"] > spy["e50"] else -1
+    s += 1 if spy["e50"] > spy["s200"] else -1
+    s += {"UP": 1, "DOWN": -1, "MIXED": 0}[spy["weekly"]]
+    s += {"UP": 1, "DOWN": -1, "MIXED": 0}[spy["monthly"]]
+    if br["n"]:
+        p50 = br["a50"] / br["n"] * 100
+        s += 1 if p50 > 60 else (-1 if p50 < 40 else 0)
+    if vix:
+        s += -1 if vix["last"] > 25 else (1 if vix["last"] < 17 else 0)
+    return s
+
+
+def regime_label(s):
+    if s <= -5:
+        return "Heavily bearish", RED
+    if s <= -2:
+        return "Bearish", RED
+    if s <= 1:
+        return "Mixed / neutral", YELLOW
+    if s <= 4:
+        return "Bullish", GREEN
+    return "Strongly bullish", GREEN
+
+
+REGIME_TEXT = {
+    "Heavily bearish": ("Almost every signal points down: prices are under their long-term averages, the weekly and "
+                        "monthly trends are down and most stocks are weak. Bounces can be sharp but tend to fail "
+                        "until the picture improves.",
+                        ["Smaller position sizes, or stay in cash. Most buy setups fail in downtrends",
+                         "Do not chase bounces. Wait for the index to climb back above its 50-day average",
+                         "Shorting is advanced: losses can be unlimited. Beginners are better off watching"]),
+    "Bearish": ("The trend is down overall, though not every signal agrees yet.",
+                ["Be pickier and use smaller sizes",
+                 "Focus on the strongest stocks only, and respect stops",
+                 "Shorting is advanced and risky; paper trade it first"]),
+    "Mixed / neutral": ("Signals disagree, which usually means choppy, hard-to-trade conditions.",
+                        ["Be selective: fewer, better trades", "Expect false breakouts", "Patience is a position"]),
+    "Bullish": ("The trend is up and most signals agree.",
+                ["Buying pullbacks in strong stocks has the wind behind it", "Keep stops: trends still have dips",
+                 "Do not oversize just because it feels easy"]),
+    "Strongly bullish": ("Nearly every signal points up. Strong trends can last, but they also get stretched.",
+                         ["Keep buying strength with stops in place", "Watch the 'could it be ending' checklist",
+                          "Avoid piling in late after a big run"]),
+}
+
+
+def tw(s):
+    return {"UP": "🟢", "DOWN": "🔴", "MIXED": "🟡"}[s]
+
+
+def ov_market_embed(label_name, hz_title, views, vix, br, score, label, col):
+    spy = views["SPY"]
+    lines = [f"**{label}**  (score {score:+d} out of ±7)", REGIME_TEXT[label][0], "", "**Indexes**"]
+    for sym, nm in OV_INDEX.items():
+        v = views.get(sym)
+        if v:
+            lines.append(f"• {nm}: **{v['last']:,.2f}**  today {v['d1']:+.1f}%, week {v['d5']:+.1f}%, month "
+                         f"{v['d21']:+.1f}%  | {abs(v['dd']):.0f}% below its 1-year high")
+    lines += ["", f"**Trend (S&P 500):** day {tw(spy['daily'])}  week {tw(spy['weekly'])}  month {tw(spy['monthly'])}",
+              f"{'Above' if spy['vs50'] >= 0 else 'Below'} its 50-day average by {abs(spy['vs50']):.1f}%, "
+              f"{'above' if spy['vs200'] >= 0 else 'below'} its 200-day by {abs(spy['vs200']):.1f}%. RSI {spy['rsi']:.0f}."]
+    if vix:
+        mood = ("calm" if vix["last"] < 15 else "normal" if vix["last"] < 20 else "nervous" if vix["last"] < 30 else "fearful")
+        lines.append(f"**Fear gauge (VIX):** {vix['last']:.1f} ({mood}), {vix['chg5']:+.1f} over 5 days")
+    if br["n"]:
+        n = br["n"]
+        lines += ["", f"**Breadth** (of {n:,} liquid stocks): {br['a50'] / n * 100:.0f}% above their 50-day average, "
+                      f"{br['a200'] / n * 100:.0f}% above their 200-day",
+                  f"New 1-year highs: **{br['hi']}**  vs new lows: **{br['lo']}**.  Up today: {br['adv'] / n * 100:.0f}%, "
+                  f"down: {br['dec'] / n * 100:.0f}%"]
+    lines += ["", "**What this usually means for you**"] + [f"• {b}" for b in REGIME_TEXT[label][1]]
+    return {"title": f"📅 {hz_title} market overview: {label}", "description": "\n".join(lines)[:4000], "color": col}
+
+
+def spy_history_note(spy):
+    try:
+        h = yf.Ticker("SPY").history(period="max", interval="1d", auto_adjust=True)["Close"].dropna().astype(float)
+        if len(h) < 1500:
+            return None
+        s200 = h.rolling(200).mean()
+        dd = h / h.rolling(252, min_periods=200).max() - 1
+        fwd = h.shift(-63) / h - 1
+        cur = float(dd.iloc[-1])
+        below = bool(h.iloc[-1] < s200.iloc[-1])
+        if cur > -0.03:
+            return None
+        m = (dd.between(cur - 0.04, cur + 0.04)) & ((h < s200) == below) & fwd.notna()
+        if int(m.sum()) < 100:
+            return None
+        f = fwd[m]
+        return (f"**History check:** since {h.index[0].year}, on {int(m.sum()):,} days when the S&P 500 was in a similar spot "
+                f"(about {abs(cur) * 100:.0f}% below its high, {'below' if below else 'above'} its 200-day average), the next "
+                f"3 months were positive {float((f > 0).mean() * 100):.0f}% of the time (median {float(f.median() * 100):+.1f}%, "
+                f"worst {float(f.min() * 100):+.0f}%, best {float(f.max() * 100):+.0f}%). Those days overlap heavily, so "
+                f"treat it as context, not a forecast.")
+    except Exception:
+        return None
+
+
+def ov_turn_embed(spy, vix, br):
+    p50 = br["a50"] / br["n"] * 100 if br["n"] else None
+    falling = spy["vs50"] < 0 or spy["daily"] != "UP"
+    if falling:
+        title = "🧭 Could the fall be ending? (bottoming checklist)"
+        items = [
+            (spy["rsi"] < 30, f"RSI under 30, oversold (now {spy['rsi']:.0f})"),
+            (spy["vs50"] <= -7, f"Price 7%+ below its 50-day average (now {spy['vs50']:+.1f}%)"),
+            (bool(vix) and (vix["last"] > 30 or (vix["hi10"] > 28 and vix["last"] < vix["hi10"] * 0.85)),
+             "Fear spike: VIX above 30, or a high peak that is now falling" + (f" (VIX {vix['last']:.0f})" if vix else "")),
+            (p50 is not None and p50 < 20, "Washout: under 20% of stocks above their 50-day average" +
+             (f" (now {p50:.0f}%)" if p50 is not None else "")),
+            (spy["low5"] > spy["low_prev"], "Higher low: the last 5 days' low is above the low before it"),
+            (spy["last"] > spy["e20"], f"Back above the 20-day average ({spy['e20']:,.0f})"),
+        ]
+    else:
+        title = "🧭 Could the rise be ending? (topping checklist)"
+        items = [
+            (spy["rsi"] > 70, f"RSI over 70, overbought (now {spy['rsi']:.0f})"),
+            (spy["vs50"] >= 7, f"Price 7%+ above its 50-day average (now {spy['vs50']:+.1f}%)"),
+            (bool(vix) and vix["last"] < 14, "Complacency: VIX under 14" + (f" (now {vix['last']:.0f})" if vix else "")),
+            (p50 is not None and (p50 > 85 or (spy["dd"] > -1 and p50 < 50)),
+             "Overextended or narrow: over 85% of stocks above their 50-day, or the index at highs with under 50%"),
+            (spy["high5"] < spy["high_prev"], "Lower high: the last 5 days' high is below the high before it"),
+            (spy["last"] < spy["e20"], f"Slipped under the 20-day average ({spy['e20']:,.0f})"),
+        ]
+    n_on = sum(1 for ok, _ in items if ok)
+    lines = [f"**{n_on} of {len(items)} signs present**"] + [f"{'✅' if ok else '⬜'} {txt}" for ok, txt in items]
+    lines += ["", ("The more boxes are ticked, the more stretched the move is and the likelier a pause or bounce. "
+                   "It is not a prediction: markets can stay oversold or overbought for weeks.")]
+    lv = [("20-day average", spy["e20"]), ("50-day average", spy["e50"]), ("200-day average", spy["s200"]),
+          ("20-day low", spy["swing_lo"]), ("20-day high", spy["swing_hi"]),
+          ("1-year low", spy["lo52"]), ("1-year high", spy["hi52"])]
+    below = sorted([x for x in lv if x[1] < spy["last"]], key=lambda z: -z[1])[:3]
+    above = sorted([x for x in lv if x[1] >= spy["last"]], key=lambda z: z[1])[:3]
+    lines += ["", f"**S&P 500 (SPY) key levels** (price {spy['last']:,.2f})"]
+    if above:
+        lines.append("Resistance above: " + ", ".join(f"{n} {v:,.0f}" for n, v in above))
+    if below:
+        lines.append("Support below: " + ", ".join(f"{n} {v:,.0f}" for n, v in below))
+    note = spy_history_note(spy)
+    if note:
+        lines += ["", note]
+    return {"title": title, "description": "\n".join(lines)[:4000], "color": BLUE}
+
+
+YF_MARKETS = [("^GSPC", "S&P 500"), ("^DJI", "Dow 30"), ("^IXIC", "Nasdaq"), ("^RUT", "Russell 2000"),
+              ("^VIX", "VIX (fear)"), ("GC=F", "Gold"), ("CL=F", "Crude oil"), ("^TNX", "10-yr yield %"),
+              ("BTC-USD", "Bitcoin"), ("DX-Y.NYB", "US dollar idx")]
+
+
+def ov_summary_embed(frames):
+    """A Yahoo Finance style 'markets' table: price, change and percent change."""
+    rows = []
+    for sym, name in YF_MARKETS:
+        df = frames.get(sym)
+        try:
+            cl = df["Close"].dropna().astype(float)
+            last, prev = float(cl.iloc[-1]), float(cl.iloc[-2])
+        except Exception:
+            continue
+        ch, pc = last - prev, (last / prev - 1) * 100
+        arrow = "▲" if ch >= 0 else "▼"
+        rows.append(f"{name:<14}{last:>10,.2f} {arrow}{abs(ch):>8,.2f} {pc:>+6.2f}%")
+    if not rows:
+        return None
+    return {"title": "🌍 Markets summary", "color": BLUE,
+            "description": "```\n" + "\n".join(rows) + "\n```\nChange is versus the previous close (crypto trades 24/7)."}
+
+
+def ov_sector_embed(mode, views, df):
+    days, when, _ = OV_HORIZON[mode]
+    key = {1: "d1", 5: "d5", 21: "d21"}[days]
+    sec = sorted([(OV_SECTORS[s], views[s][key]) for s in OV_SECTORS if views.get(s)], key=lambda z: -z[1])
+    lines = [f"**Sectors, {when}** (best to worst)"]
+    lines += [f"{'🟢' if v >= 0 else '🔴'} {n}: {v:+.1f}%" for n, v in sec]
+    col = {1: "r1", 5: "r5", 21: "r21"}[days]
+    if len(df):
+        up, dn = df.nlargest(6, col), df.nsmallest(6, col)
+        lines += ["", f"**Top gainers {when}:** " + ", ".join(f"{r.t} {getattr(r, col):+.0f}%" for r in up.itertuples())]
+        lines += [f"**Top losers {when}:** " + ", ".join(f"{r.t} {getattr(r, col):+.0f}%" for r in dn.itertuples())]
+        act = df.nlargest(8, "dv")
+        lines += ["", "**Most active** (most money traded per day): " +
+                  ", ".join(f"{r.t} {money_short(r.dv)}" for r in act.itertuples())]
+    return {"title": f"🏭 Sectors and movers ({when})", "description": "\n".join(lines)[:4000], "color": BLUE}
+
+
+def ov_picks(df):
+    """Rank every liquid stock by trend + momentum, return (long_rows, short_rows)."""
+    if df.empty:
+        return [], []
+    d = df.copy()
+    d["score"] = (0.45 * d["mom"].rank(pct=True) + 0.25 * d["r63"].rank(pct=True) +
+                  0.20 * d["prox"].rank(pct=True) + 0.10 * d["r21"].rank(pct=True))
+    lg = d[(d["price"] > d["e50"]) & (d["e50"] > d["s200"]) & (d["price"] > d["s200"]) &
+           (d["prox"] >= 0.85) & (d["rsi"] < 80)].sort_values("score", ascending=False)
+    sh = d[(d["price"] < d["e50"]) & (d["e50"] < d["s200"]) & (d["price"] < d["s200"]) &
+           (d["prox"] <= 0.75) & (d["rsi"] > 25)].sort_values("score", ascending=True)
+
+    def screen(frame):
+        out = []
+        for r in frame.head(30).itertuples():
+            ed = days_to_earnings(r.t)
+            if ed is not None and 0 <= ed <= CFG["earn_days"]:
+                continue
+            out.append((r, ed))
+            if len(out) >= 10:
+                break
+        return out
+    return screen(lg), screen(sh)
+
+
+def ov_pick_embed(rows, long_side, label):
+    if not rows:
+        return {"title": f"{'🟢 Strongest stocks (long ideas)' if long_side else '🔴 Weakest stocks (short ideas)'}",
+                "description": "No stock passed all the checks today. That is normal in this kind of market.",
+                "color": BLUE}
+    lines = []
+    for i, (r, ed) in enumerate(rows, 1):
+        gap = (1 - r.prox) * 100
+        extra = f", earnings in {ed}d" if ed is not None and ed <= 14 else ""
+        lines.append(f"**{i}. {r.t}** {money(r.price)}  1m {r.r21:+.0f}%, 3m {r.r63:+.0f}%, {gap:.0f}% below 1-yr high, "
+                     f"RSI {r.rsi:.0f}, {money_short(r.dv)}/day{extra}")
+        lines.append(f"    Idea is wrong if it closes {'below' if long_side else 'above'} its 50-day average "
+                     f"(about {money(r.e50)})")
+    if long_side:
+        title = "🟢 Strongest stocks (long ideas)"
+        tail = ("Ranked by momentum and trend: stocks in uptrends that are leading the market. "
+                + ("In a downtrend market even leaders often fall, so size small. " if label in ("Heavily bearish", "Bearish") else "")
+                + "This is a screen, not advice: the strategy tests showed no proven edge.")
+    else:
+        title = "🔴 Weakest stocks (short ideas)"
+        tail = ("Ranked by weakness: stocks in downtrends that are lagging. Shorting can lose more than you put in, needs a "
+                "broker that allows it, and sharp bounces happen. For beginners this list is for learning and watching. "
+                "Not advice.")
+    return {"title": title, "description": ("\n".join(lines) + "\n\n" + tail)[:4000],
+            "color": GREEN if long_side else RED}
+
+
+def run_overview(modes, lists_for=("weekly", "monthly")):
+    """Post the market overview. modes: list of 'daily' / 'weekly' / 'monthly'."""
+    names = list(OV_INDEX) + list(OV_SECTORS) + ["^VIX"]
+    frames = split_frames(download_chunk(names), names)
+    ysyms = [s for s, _ in YF_MARKETS]
+    yframes = split_frames(download_chunk(ysyms), ysyms)
+    views = {k: index_view(frames[k]) for k in list(OV_INDEX) + list(OV_SECTORS) if k in frames}
+    views = {k: v for k, v in views.items() if v}
+    vix = vix_view(frames["^VIX"]) if "^VIX" in frames else None
+    if "SPY" not in views:
+        post(embeds=[{"title": "📅 Market overview", "color": RED,
+                      "description": "Could not download index prices right now. Try again in a few minutes."}])
+        return
+    df, br = ov_universe()
+    spy = views["SPY"]
+    score = regime_score(spy, vix, br)
+    label, col = regime_label(score)
+    need_lists = any(m in lists_for for m in modes)
+    longs, shorts = ov_picks(df) if need_lists else ([], [])
+    summ = ov_summary_embed(yframes)
+    top = [m for m in ("monthly", "weekly", "daily") if m in modes][0]      # longest horizon sets the headline
+    if summ:
+        post(embeds=[summ])
+    post(embeds=[ov_market_embed(top, "/".join(OV_HORIZON[m][2] for m in modes), views, vix, br, score, label, col)])
+    post(embeds=[ov_turn_embed(spy, vix, br)])
+    for m in modes:
+        post(embeds=[ov_sector_embed(m, views, df)])
+    if need_lists:
+        post(embeds=[ov_pick_embed(longs, True, label)])
+        post(embeds=[ov_pick_embed(shorts, False, label)])
+
+
+def overview_modes(text):
+    """Turn what the user typed into the list of overviews to post. Returns (modes, lists_for)."""
+    s = (text or "").strip().lower()
+    if s == "auto":
+        now = pd.Timestamp.now(tz="America/New_York")
+        spy, spy_date = spy_trend()
+        if spy_date is not None and spy_date < now.date():
+            return [], ()
+        modes = ["daily"]
+        if now.weekday() == 4:
+            modes.append("weekly")
+        if (now + pd.offsets.BDay(1)).month != now.month:
+            modes.append("monthly")
+        return modes, ("weekly", "monthly")
+    if s.startswith("w"):
+        return ["weekly"], ("weekly",)
+    if s.startswith("m"):
+        return ["monthly"], ("monthly",)
+    if s.startswith("f") or s == "all":
+        return ["daily"], ("daily",)
+    return ["daily"], ("daily",)
+
+
 def main():
     c = CFG
     if "--glossary" in sys.argv:
@@ -1511,6 +1912,15 @@ def main():
 
     if "--selftest" in sys.argv:
         run_selftest()
+        return
+
+    ov_text = os.getenv("OVERVIEW", "").strip() or " ".join(cli_args("--overview"))
+    if ov_text or "--overview" in sys.argv:
+        modes, lists_for = overview_modes(ov_text if ov_text.lower() not in ("false", "0") else "")
+        if modes:
+            run_overview(modes, lists_for)
+        else:
+            print("US market was closed today. No overview.")
         return
 
     if "--compare" in sys.argv or os.getenv("COMPARE", "").strip().lower() not in ("", "false", "0"):
