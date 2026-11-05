@@ -1,15 +1,55 @@
 name: Daily stock scan
 
+# Runs by itself every weekday after the US close.
+# It also TESTS ITSELF automatically whenever you upload or change scanner.py, scan.yml or
+# requirements.txt, and posts a pass/fail report to Discord.
+# You can also tap "Run workflow" (Actions tab) and fill in ONE box to give the bot a command:
+#   selftest     = test that everything works (about 1 minute)
+#   analyze      = full analysis of one or more stocks (with news)
+#   news         = latest headlines only
+#   watch_add    = add stocks to your watchlist
+#   watch_remove = remove stocks from your watchlist ("*" clears it)
+# Leave every box empty to run the full market scan right now.
+
 on:
   schedule:
     # 22:00 UTC, Monday to Friday (after the US market closes)
     - cron: "0 22 * * 1-5"
+  push:
+    paths:
+      - "scanner.py"
+      - "requirements.txt"
+      - ".github/workflows/scan.yml"
   workflow_dispatch:
     inputs:
+      selftest:
+        description: "TEST the bot: checks prices, Discord and every feature (about 1 minute)"
+        type: boolean
+        default: false
+      analyze:
+        description: "ANALYSE stocks, e.g. NVDA or NVDA AAPL TSLA"
+        type: string
+        default: ""
+      news:
+        description: "NEWS for stocks, e.g. NVDA AAPL"
+        type: string
+        default: ""
+      watch_add:
+        description: "ADD to watchlist, e.g. KEEL PLTR"
+        type: string
+        default: ""
+      watch_remove:
+        description: "REMOVE from watchlist, e.g. KEEL (or * to clear it)"
+        type: string
+        default: ""
       glossary:
         description: "Post the beginner glossary to Discord instead of scanning"
         type: boolean
         default: false
+
+# needed so the "add / remove" commands can save watchlist.txt back to your repository
+permissions:
+  contents: write
 
 jobs:
   scan:
@@ -29,7 +69,30 @@ jobs:
       - name: Run scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python scanner.py ${{ inputs.glossary && '--glossary' || '' }}
+          ANALYZE_TICKERS: ${{ inputs.analyze }}
+          NEWS_TICKERS: ${{ inputs.news }}
+          WATCH_ADD: ${{ inputs.watch_add }}
+          WATCH_REMOVE: ${{ inputs.watch_remove }}
+          GLOSSARY: ${{ inputs.glossary }}
+          SELFTEST: ${{ inputs.selftest }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$GLOSSARY" = "true" ]; then
+            python scanner.py --glossary
+          elif [ "$SELFTEST" = "true" ] || [ "$EVENT" = "push" ]; then
+            python scanner.py --selftest
+          else
+            python scanner.py
+          fi
+
+      - name: Save watchlist changes
+        if: ${{ inputs.watch_add != '' || inputs.watch_remove != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add watchlist.txt
+          git diff --cached --quiet || git commit -m "Update watchlist"
+          git push
 
       - name: Save results
         if: always()
