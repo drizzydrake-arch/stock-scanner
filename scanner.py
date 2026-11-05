@@ -1269,6 +1269,76 @@ def _split_stats(trades, cutoff, cost_pct):
     return accuracy_stats(a, cost_pct), accuracy_stats(b, cost_pct)
 
 
+def _rsi_n(cl, n):
+    d = cl.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def family_signals(x):
+    """Other well-known long-only ideas, built from the same price data."""
+    cl = x["c"]
+    sma200 = cl.rolling(200).mean()
+    sma5 = cl.rolling(5).mean()
+    hh55 = x["h"].rolling(55).max().shift(1)
+    ll20 = x["l"].rolling(20).min().shift(1)
+    hi252 = cl.rolling(252).max().shift(1)
+    up = (cl > sma200)
+    return {
+        "break": dict(entry=((cl > hh55) & up & (x["ema_t"] > sma200)).fillna(False).values, stop=2.5, trail=3.0,
+                      exit=(cl < ll20).fillna(False).values, bars=None),
+        "dip": dict(entry=((_rsi_n(cl, 2) < 10) & up).fillna(False).values, stop=3.0, trail=None,
+                    exit=(cl > sma5).fillna(False).values, bars=10),
+        "high": dict(entry=((cl >= hi252) & up).fillna(False).values, stop=2.5, trail=3.0,
+                     exit=(cl < ll20).fillna(False).values, bars=None),
+    }
+
+
+def backtest_g(x, sig, gate=None):
+    """Generic long-only replay: entry flags, ATR-based stop, optional trailing stop, exit flags, time stop."""
+    c = CFG
+    n = len(x)
+    o, h, l, cl, atr = (x[k].values for k in ("o", "h", "l", "c", "atr"))
+    entry_f, exit_f = sig["entry"], sig["exit"]
+    pos, entry, stop, risk, hh, bars, last_exit = 0, 0.0, 0.0, 0.0, 0.0, 0, -999
+    trades = []
+    for i in range(60, n):
+        if pos:
+            bars += 1
+            r = None
+            if o[i] <= stop:
+                r = (o[i] - entry) / risk
+            elif l[i] <= stop:
+                r = (stop - entry) / risk
+            elif exit_f[i] or (sig["bars"] and bars >= sig["bars"]):
+                r = (cl[i] - entry) / risk
+            if r is not None:
+                trades.append((x.index[i], r, risk / entry))
+                pos, last_exit = 0, i
+                continue
+            if sig["trail"]:
+                hh = max(hh, h[i])
+                stop = max(stop, hh - sig["trail"] * atr[i])
+        if not pos and i - last_exit > c["cooldown"] and entry_f[i] and (gate is None or gate[i]) \
+                and not np.isnan(atr[i]) and atr[i] > 0:
+            pos, entry, bars = 1, cl[i], 0
+            risk = sig["stop"] * atr[i]
+            stop = entry - risk
+            hh = h[i]
+    return trades
+
+
+FAMILY_NAMES = [
+    ("55-day breakout trend", "break", False),
+    ("55-day breakout + market", "break", True),
+    ("RSI-2 dip in uptrend", "dip", False),
+    ("RSI-2 dip + market", "dip", True),
+    ("52-week-high momentum", "high", False),
+    ("52-week-high + market", "high", True),
+]
+
+
 def run_compare(text, sample=400, cost_pct=0.2):
     """Test many possible improvements side by side. Results are split into an older period and a newer one."""
     c = CFG
@@ -1284,6 +1354,7 @@ def run_compare(text, sample=400, cost_pct=0.2):
         spy_df = yf.Ticker("SPY").history(period="5y", interval="1d", auto_adjust=True)
         sctx = spy_context(spy_df["Close"])
         trades = {nm: [] for nm, _ in LAB_VARIANTS}
+        ftr = {nm: [] for nm, _, _ in FAMILY_NAMES}
         tested = 0
         for k in range(0, len(pool), c["chunk"]):
             chunk = pool[k:k + c["chunk"]]
@@ -1297,37 +1368,49 @@ def run_compare(text, sample=400, cost_pct=0.2):
                     for nm, v in LAB_VARIANTS:
                         gate = gate_array(v.get("g"), x, sctx)
                         trades[nm] += backtest_v(x, v.get("rr", 2.0), v.get("be"), v.get("ts"), gate)
+                    sg = family_signals(x)
+                    mk = gate_array(["mkt"], x, sctx)
+                    for nm, key, usemkt in FAMILY_NAMES:
+                        ftr[nm] += backtest_g(x, sg[key], mk if usemkt else None)
                 except Exception:
                     continue
     finally:
         c["history_period"] = old
 
     cutoff = pd.Timestamp("2025-01-01")
-    rows, scored = [], []
-    for nm, _ in LAB_VARIANTS:
-        a, b = _split_stats(trades[nm], cutoff, cost_pct)
-        def cell(s):
-            return "   n/a        " if not s else f"{s['n']:>4} {s['win']:>3.0f}% {s['avg_r_net']:+.2f}R"
-        rows.append(f"{nm[:34]:<34} {cell(a)} | {cell(b)}")
-        if a and b and a["n"] >= 40 and b["n"] >= 30:
-            scored.append((min(a["avg_r_net"], b["avg_r_net"]), nm, a, b))
-    scored.sort(key=lambda z: z[0], reverse=True)
-    head = f"Tested {tested} stocks, 5 years. Costs of {cost_pct}% per trade are included. R = profit in units of risk."
-    if scored and scored[0][0] > 0.05:
-        best = scored[0]
+
+    def build_rows(names_trades):
+        rows, scored = [], []
+        for nm, tr in names_trades:
+            a, b = _split_stats(tr, cutoff, cost_pct)
+
+            def cell(s):
+                return "    n/a      " if not s else f"{s['n']:>4}{s['win']:>3.0f}%{s['avg_r_net']:+5.2f}"
+            rows.append(f"{nm[:21]:<21}{cell(a)}|{cell(b)}")
+            if a and b and a["n"] >= 40 and b["n"] >= 30:
+                scored.append((min(a["avg_r_net"], b["avg_r_net"]), nm, a, b))
+        scored.sort(key=lambda z: z[0], reverse=True)
+        return rows, scored
+
+    rows1, sc1 = build_rows([(nm, trades[nm]) for nm, _ in LAB_VARIANTS])
+    rows2, sc2 = build_rows([(nm, ftr[nm]) for nm, _, _ in FAMILY_NAMES])
+    allsc = sorted(sc1 + sc2, key=lambda z: z[0], reverse=True)
+    head = f"Tested {tested} stocks, 5 years, {cost_pct}% cost per trade included."
+    if allsc and allsc[0][0] > 0.05:
+        best = allsc[0]
         verdict = (f"🟢 **Best in BOTH periods: {best[1]}**\n"
-                   f"Older period {best[2]['avg_r_net']:+.2f}R per trade, newer period {best[3]['avg_r_net']:+.2f}R.\n"
-                   f"Only trust it if the same variant also stays positive in the next test and in live tracking. "
-                   f"With {len(LAB_VARIANTS)} variants tried, one may look good by luck.")
+                   f"Older {best[2]['avg_r_net']:+.2f}R, newer {best[3]['avg_r_net']:+.2f}R per trade "
+                   f"({best[2]['n']} and {best[3]['n']} trades).\n"
+                   f"Many ideas were tried, so confirm it on a second run and in live tracking before trusting it.")
         col = GREEN
     else:
-        verdict = ("🔴 **No variant was clearly positive in both periods.** That is a real answer: the idea may "
-                   "not have an edge on daily stocks, and it is better to know before risking money.")
-        col = RED if not scored else YELLOW
-    table = "```\nVariant                            OLDER (to 2024)     | NEWER (2025 on)\n" + "\n".join(rows) + "\n```"
-    legend = "Columns: trades, % won, average profit per trade after costs. Above +0.10R in both periods is the goal."
-    post(embeds=[{"title": "🧪 Strategy lab: which improvements help?",
-                  "description": (head + "\n\n" + verdict + "\n\n" + table + "\n" + legend)[:4000], "color": col}])
+        verdict = "🔴 **Nothing was clearly positive in both periods.**"
+        col = RED if not allsc else YELLOW
+    hdr = "Idea                  OLDER (to 2024) |NEWER (2025 on)\n"
+    desc = (head + "\n\n" + verdict + "\n\n**Tweaks to your strategy**\n```\n" + hdr + "\n".join(rows1) +
+            "\n```\n**Different strategy types**\n```\n" + hdr + "\n".join(rows2) +
+            "\n```\nEach side: trades, % won, average R per trade after costs. Goal: above +0.10 in both.")
+    post(embeds=[{"title": "🧪 Strategy lab: which ideas work?", "description": desc[:4000], "color": col}])
 
 
 def main():
