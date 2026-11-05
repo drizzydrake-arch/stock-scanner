@@ -1,0 +1,40 @@
+name: Daily stock scan
+
+on:
+  schedule:
+    # 22:00 UTC, Monday to Friday (after the US market closes)
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      glossary:
+        description: "Post the beginner glossary to Discord instead of scanning"
+        type: boolean
+        default: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scanner.py ${{ inputs.glossary && '--glossary' || '' }}
+
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: results/
+          if-no-files-found: ignore
