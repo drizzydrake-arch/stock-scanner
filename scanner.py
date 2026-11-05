@@ -22,6 +22,7 @@ import datetime as dt
 import io
 import math
 import os
+import re
 import sys
 import time
 
@@ -66,6 +67,7 @@ CFG = dict(
     max_trades_shown=8,
     max_watch_shown=10,
     max_blocked_shown=10,
+    watchlist_only=False,      # True = scan ONLY the stocks in watchlist.txt; False = whole market + your watchlist
     chunk=150,
     history_period="2y",
 )
@@ -343,7 +345,7 @@ def spy_trend():
 
 # ------------------------------- DISCORD --------------------------------
 def post(content=None, embeds=None):
-    payload = {}
+    payload = {"allowed_mentions": {"parse": []}}   # never let text from the web ping people
     if content:
         payload["content"] = content[:1990]
         print("\n" + content)
@@ -501,11 +503,421 @@ GLOSSARY = (
 )
 
 
+# ------------------------ TICKER LISTS AND ANALYSIS ---------------------
+TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+
+
+def tokens(text):
+    """Pull valid-looking ticker symbols out of free text (spaces or commas between them)."""
+    out = []
+    for raw in text.replace(",", " ").split():
+        tok = raw.strip().strip(".,;:!?'\"()[]").upper()
+        if TICKER_RE.match(tok):
+            out.append(tok)
+    return list(dict.fromkeys(out))
+
+
+def load_tickers(path):
+    """Read a ticker list file: one per line, '#' starts a comment."""
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        lines = [ln.split("#")[0] for ln in f]
+    return tokens(" ".join(lines))
+
+
+def status_text(last):
+    """One plain-English line about where a stock stands today (used for watchlist mode)."""
+    if last["long_setup"]:
+        return "✅ BUY setup found"
+    if last["long_raw"] and last["anomaly"]:
+        return "⛔ setup found but blocked: " + "; ".join(reasons(last))
+    if last["near_long"] and not last["anomaly"]:
+        return "👀 almost ready, look again tomorrow"
+    if last["c"] > last["ema_t"] and last["slope"] > 0:
+        trend = "an uptrend"
+    elif last["c"] < last["ema_t"] and last["slope"] < 0:
+        trend = "a downtrend"
+    else:
+        trend = "a sideways trend"
+    extra = " (low liquidity)" if last["illiquid"] else ""
+    return f"no setup yet, in {trend}{extra}"
+
+
+def tick(ok):
+    return "✅" if ok else "❌"
+
+
+def analyze_embed(t, spy):
+    """Full plain-English analysis of one stock against every rule of the strategy."""
+    c = CFG
+    try:
+        df = yf.Ticker(t).history(period=c["history_period"], interval="1d", auto_adjust=True)
+    except Exception:
+        df = None
+    if df is None or len(df) < 120:
+        return {"title": f"🔍 {t}", "color": YELLOW,
+                "description": "I could not get enough price history for this symbol (I need about 6 months). "
+                               "Check the spelling, for example BRK-B instead of BRK.B."}
+    x = build(df)
+    last, prev = x.iloc[-1], x.iloc[-2]
+    price = float(last["c"])
+    chg = (price / float(prev["c"]) - 1) * 100
+
+    # each rule on its own
+    macd, sig = x["macd"], x["sig"]
+    cross_up = (macd > sig) & (macd.shift() <= sig.shift()) & (macd < 0)
+    since = barssince(cross_up).iloc[-1]
+    up = bool(last["c"] > last["ema_t"] and last["slope"] > -c["flat_thr"])
+    pb = bool(((x["l"] <= x["ema_f"] + x["atr"] * c["pb_tol"]).astype(int).rolling(c["pb_bars"]).sum() > 0).iloc[-1])
+    macd_ok = bool(not np.isnan(since) and since <= c["confirm_win"])
+    mom = bool(last["c"] > last["ema_f"] and last["hist"] > 0)
+    rsi_v = float(last["rsi"])
+    rsi_rise = bool(rsi_v > float(prev["rsi"]))
+    rsi_dipped = bool(x["rsi"].rolling(c["pb_bars"]).min().iloc[-1] <= c["rsi_dip"])
+    rsi_ok = (c["rsi_min"] <= rsi_v <= c["rsi_max"]) and rsi_rise and rsi_dipped
+    vol_ok = bool(last["vol_ratio"] >= c["vol_mult"])
+    warn = reasons(last)
+    ed = days_to_earnings(t)
+    earn_soon = ed is not None and 0 <= ed <= c["earn_days"]
+    spy_ok = spy != "DOWN"
+    slope = float(last["slope"])
+
+    core = [
+        (up, "Uptrend",
+         f"price {money(price)} vs 50-day average {money(float(last['ema_t']))}, the average is "
+         f"{'rising' if slope >= c['flat_thr'] else 'falling' if slope <= -c['flat_thr'] else 'roughly flat'} "
+         f"({slope:+.1f}% over 10 days)"),
+        (pb, "Pullback",
+         f"dipped to the 9-day average ({money(float(last['ema_f']))}) within the last {c['pb_bars']} days" if pb
+         else f"has not dipped to the 9-day average ({money(float(last['ema_f']))}) recently"),
+        (macd_ok, "MACD turned up from below zero",
+         f"crossed {int(since)} day(s) ago" if macd_ok else f"no fresh cross in the last {c['confirm_win']} days"),
+        (mom, "Momentum back",
+         "closed above the 9-day average with a green histogram" if mom
+         else "not yet closed above the 9-day average with a green histogram"),
+        (rsi_ok, "RSI healthy",
+         f"RSI {rsi_v:.0f} and {'rising' if rsi_rise else 'falling'} "
+         f"(wanted {c['rsi_min']}-{c['rsi_max']}, rising, and a dip to {c['rsi_dip']} or lower)"),
+        (vol_ok, "Volume", f"{float(last['vol_ratio']):.1f}x the 20-day average"),
+    ]
+    n = sum(1 for ok, _, _ in core if ok)
+    blockers = list(warn)
+    if earn_soon:
+        blockers.append(f"earnings report in {ed} day(s)")
+    if not spy_ok:
+        blockers.append("the S&P 500 is in a downtrend")
+
+    missing = [name for ok, name, _ in core if not ok]
+    hints = {
+        "Pullback": f"Wait for a dip toward the 9-day average ({money(float(last['ema_f']))}).",
+        "MACD turned up from below zero": "Wait for the MACD line to cross above its signal line while it is still "
+                                          "below zero.",
+        "Momentum back": "Wait for a close above the 9-day average.",
+        "RSI healthy": f"Wait for RSI to turn up inside {c['rsi_min']}-{c['rsi_max']}.",
+        "Volume": "Wait for a day with above-average volume.",
+    }
+    hint = ""
+    stats = backtest(x, c["allow_shorts"])
+    plan = ""
+    if n == len(core) and not blockers:
+        verdict, color = "🟢 BUY setup is active right now.", GREEN
+        stop = float(last["stop_long"])
+        risk = price - stop
+        if risk > 0:
+            shares = int(math.floor(c["account"] * c["risk_pct"] / 100 / risk))
+            shares = max(0, min(shares, int(c["account"] // price)))
+            total, grade, _ = score_trade(last, "BUY", stats, spy)
+            plan = (f"\n\n**PLAN IF YOU BOUGHT TODAY** (grade {grade}, score {total:.0f}/100)\n"
+                    f"• Buy around {money(price)}\n"
+                    f"• Stop (safety exit): {money(stop)}, a loss of {money(risk)} per share\n"
+                    f"• Target: {money(price + c['rr'] * risk)} (about {c['rr']:.0f}x the risk)\n"
+                    f"• Size: about {shares} shares for {c['risk_pct']:g}% account risk")
+    elif n == len(core):
+        verdict, color = ("🟡 The pattern is there, but it is blocked: " + "; ".join(blockers) +
+                          ". Skip it for now."), YELLOW
+    elif not up:
+        verdict, color = ("🔴 No trade. The stock is not in an uptrend, so this strategy stays out. Wait for price "
+                          "to climb back above a rising 50-day average."), RED
+    else:
+        verdict, color = (f"🔵 Not ready yet ({n} of {len(core)} checks pass). Still waiting for: "
+                          f"{', '.join(missing)}."), BLUE
+        hint = "\n" + hints.get(missing[0], "")
+
+    lines = [f"**{verdict}**{hint}", "", "**CHECKLIST**"]
+    for ok, name, detail in core:
+        lines.append(f"{tick(ok)} **{name}**: {detail}")
+    lines.append(f"{tick(not last['illiquid'])} **Liquidity**: about {money_short(float(last['dollar_vol']))} traded per day"
+                 + ("" if not last["illiquid"] else " (too low to trade safely)"))
+    lines.append(f"{tick(not warn)} **Warning signs**: " + ("none" if not warn else "; ".join(warn)))
+    mood = {"UP": "uptrend", "DOWN": "downtrend"}.get(spy, "unknown")
+    lines.append(f"{tick(spy_ok)} **Market (S&P 500)**: {mood}")
+    lines.append(f"{tick(not earn_soon)} **Earnings**: " +
+                 (f"next report in about {ed} days" if ed is not None else "date unknown, check it yourself"))
+    lines += ["", "**KEY LEVELS**",
+              f"• 9-day average: {money(float(last['ema_f']))}",
+              f"• 50-day average: {money(float(last['ema_t']))}",
+              f"• Lowest price in the last 20 days: {money(float(x['l'].tail(20).min()))}",
+              f"• Highest price in the last 60 days: {money(float(last['hi60']))}"]
+    if plan:
+        lines += ["", plan.strip("\n")]
+    lines += ["", "**LATEST NEWS** (context only, check the source before acting)"] + news_lines(t, 3)
+    lines += ["", "**PAST RECORD ON THIS STOCK**", track_record_text(t, stats),
+              "", "Education only, not financial advice."]
+    return {"title": f"🔍 {t}  {money(price)}  ({chg:+.1f}% today)",
+            "description": "\n".join(lines)[:4000], "color": color}
+
+
+def run_analysis(tickers):
+    spy, _ = spy_trend()
+    mood = ("🟢 Uptrend" if spy == "UP" else "🔴 Downtrend" if spy == "DOWN" else "⚪ Unknown")
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    note = ""
+    if now_et.weekday() < 5 and (now_et.hour < 16 or (now_et.hour == 16 and now_et.minute < 10)):
+        note = "\n⚠️ The US market may still be open, so today's candle is not finished and results can change."
+    post(content=f"🔍 **Stock analysis**: {', '.join(tickers)}\nMarket mood (S&P 500): {mood}{note}")
+    for t in tickers:
+        post(embeds=[analyze_embed(t, spy)])
+
+
+def clean_text(s, n=130):
+    """Headlines come from the web: strip anything that could break formatting or ping people."""
+    s = re.sub(r"https?://\S+", "", str(s))
+    s = " ".join(s.split())
+    s = s.replace("[", "(").replace("]", ")").replace("@", "@ ").replace("`", "'")
+    return s[:n]
+
+
+def get_news(t, n=3):
+    """Latest headlines for a ticker from Yahoo Finance (handles the old and new data layouts)."""
+    try:
+        raw = yf.Ticker(t).news or []
+    except Exception:
+        return []
+    out = []
+    now = pd.Timestamp.now(tz="UTC")
+    for it in raw:
+        try:
+            cont = it.get("content") or it
+            title = clean_text(cont.get("title") or "")
+            if not title:
+                continue
+            prov = cont.get("provider") or {}
+            src = clean_text(prov.get("displayName") or cont.get("publisher") or "", 30)
+            when = cont.get("pubDate") or cont.get("displayTime") or it.get("providerPublishTime")
+            if isinstance(when, (int, float)):
+                ts = pd.to_datetime(when, unit="s", utc=True)
+            else:
+                ts = pd.to_datetime(when, utc=True)
+            hrs = (now - ts).total_seconds() / 3600
+            age = f"{int(hrs)}h ago" if hrs < 48 else f"{int(hrs // 24)}d ago"
+            url = ((cont.get("canonicalUrl") or {}).get("url")
+                   or (cont.get("clickThroughUrl") or {}).get("url") or it.get("link") or "")
+            url = (str(url).replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+                   if str(url).startswith("https://") else "")
+            out.append((title, src, age, url))
+        except Exception:
+            continue
+        if len(out) >= n:
+            break
+    return out
+
+
+def news_lines(t, n=3):
+    items = get_news(t, n)
+    if not items:
+        return ["No recent headlines found."]
+    return [f"• [{title}]({url}) ({src}, {age})" if url else f"• {title} ({src}, {age})"
+            for title, src, age, url in items]
+
+
+def run_news(tickers):
+    post(content=f"📰 **Latest news**: {', '.join(tickers)}")
+    for t in tickers:
+        body = news_lines(t, 6) + ["", "Headlines are context only. They can be old, wrong or promotional, so "
+                                       "check the source before acting."]
+        post(embeds=[{"title": f"📰 {t}: latest headlines", "description": "\n".join(body)[:4000], "color": BLUE}])
+
+
+WATCH_FILE = "watchlist.txt"
+
+
+def cli_args(flag):
+    """Words that follow a command-line flag, up to the next flag."""
+    if flag not in sys.argv:
+        return []
+    out = []
+    for a in sys.argv[sys.argv.index(flag) + 1:]:
+        if a.startswith("--"):
+            break
+        out.append(a)
+    return out
+
+
+def update_watchlist(add_text, remove_text):
+    cur = load_tickers(WATCH_FILE)
+    clear = remove_text.strip().lower() in ("*", "clear")
+    rem = set(cur) if clear else set(tokens(remove_text))
+    removed = [t for t in cur if t in rem]
+    kept = [t for t in cur if t not in rem]
+    added, bad = [], []
+    for t in tokens(add_text):
+        if t in kept or t in added:
+            continue
+        try:
+            ok = len(yf.Ticker(t).history(period="1mo", interval="1d")) > 0
+        except Exception:
+            ok = False
+        (added if ok else bad).append(t)
+    new = kept + added
+    with open(WATCH_FILE, "w") as f:
+        f.write("# Your watchlist: one ticker per line. Edit here, or use the Run workflow buttons.\n")
+        f.write("\n".join(new) + ("\n" if new else ""))
+    lines = ["📋 **Watchlist updated**"]
+    if added:
+        lines.append("➕ Added: " + ", ".join(added))
+    if removed:
+        lines.append("➖ Removed: " + ", ".join(removed))
+    if bad:
+        lines.append("⚠️ Could not find data for: " + ", ".join(bad) + " (not added, check the spelling)")
+    if not (added or removed or bad):
+        lines.append("No changes.")
+    lines.append(f"Now watching {len(new)}: " + (", ".join(new) if new else "nothing (the whole market is still scanned)"))
+    post(content="\n".join(lines))
+
+
+def run_selftest():
+    """Check that every part of the bot works with real data, and report in Discord (about 1 minute)."""
+    c = CFG
+    res = []   # (status, name, detail) where status is ok / warn / fail
+
+    def add(status, name, detail):
+        res.append((status, name, detail))
+
+    spy_df = None
+    try:
+        spy_df = yf.Ticker("SPY").history(period=c["history_period"], interval="1d", auto_adjust=True)
+        last_day = pd.Timestamp(spy_df.index[-1]).tz_localize(None).normalize()
+        age = (pd.Timestamp.now().normalize() - last_day).days
+        if len(spy_df) >= 400 and age <= 5:
+            add("ok", "Price data", f"downloaded {len(spy_df)} days of SPY prices, latest {last_day.date()}")
+        else:
+            add("warn", "Price data", f"only {len(spy_df)} days, latest {last_day.date()} (data may be stale)")
+    except Exception as e:
+        add("fail", "Price data", f"could not download prices ({type(e).__name__})")
+
+    try:
+        syms = get_universe()
+        if len(syms) > 3000:
+            add("ok", "Stock list", f"{len(syms):,} US stocks found for the daily scan")
+        else:
+            add("warn", "Stock list", f"only {len(syms)} stocks (the official list was unreachable, so the small "
+                                      f"backup list is being used)")
+    except Exception as e:
+        add("fail", "Stock list", f"could not build the stock list ({type(e).__name__})")
+
+    sample = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "XOM"]
+    frames = {}
+    try:
+        frames = split_frames(download_chunk(sample), sample)
+        add("ok" if len(frames) >= 8 else "warn", "Bulk download", f"{len(frames)} of {len(sample)} test stocks "
+                                                                    f"downloaded in one batch")
+    except Exception as e:
+        add("fail", "Bulk download", f"batch download failed ({type(e).__name__})")
+
+    try:
+        df = frames.get("AAPL")
+        if df is None:
+            df = spy_df
+        x = build(df)
+        stats = backtest(x)
+        last = x.iloc[-1]
+        add("ok", "Strategy engine", f"indicators and rules ran (RSI {float(last['rsi']):.0f}, past-record check "
+                                     f"found {stats['n']} trades)")
+    except Exception as e:
+        add("fail", "Strategy engine", f"the strategy code crashed ({type(e).__name__}: {e})")
+
+    spy, _ = spy_trend()
+    add("ok" if spy else "warn", "Market mood", f"S&P 500 trend: {spy}" if spy else "could not work out the S&P 500 trend")
+
+    ed = days_to_earnings("AAPL")
+    add("ok" if ed is not None else "warn", "Earnings dates",
+        f"AAPL's next report is in about {ed} days" if ed is not None
+        else "earnings dates unavailable (the bot will say 'date unknown' on cards)")
+
+    try:
+        n_news = len(get_news("AAPL", 3))
+        add("ok" if n_news else "warn", "News", f"{n_news} recent AAPL headlines found" if n_news
+            else "no headlines found (the news section will say so)")
+    except Exception as e:
+        add("warn", "News", f"headline lookup failed ({type(e).__name__})")
+
+    try:
+        card = analyze_embed("AAPL", spy)
+        good = card["title"].startswith("🔍") and len(card["description"]) > 300 and "CHECKLIST" in card["description"]
+        add("ok" if good else "fail", "Analysis command", "full AAPL analysis card built" if good
+            else "the analysis card came back empty")
+    except Exception as e:
+        add("fail", "Analysis command", f"crashed ({type(e).__name__}: {e})")
+
+    wl = load_tickers(WATCH_FILE)
+    add("ok", "Watchlist", f"{len(wl)} stock(s) on your watchlist" if wl else "empty (add stocks with the Run "
+                                                                              "workflow form)")
+
+    icon = {"ok": "✅", "warn": "⚠️", "fail": "❌"}
+    n_ok = sum(1 for s_, _, _ in res if s_ == "ok")
+    n_fail = sum(1 for s_, _, _ in res if s_ == "fail")
+    lines = [f"{icon[s_]} **{name}**: {detail}" for s_, name, detail in res]
+    lines += ["", "✅ works  •  ⚠️ works but check the note  •  ❌ broken, send me this message and I will fix it"]
+    if not os.getenv("DISCORD_WEBHOOK_URL"):
+        n_fail += 1
+        lines.insert(0, "❌ **Discord**: DISCORD_WEBHOOK_URL is not set (Settings, Secrets and variables, Actions)")
+    title = (f"🧪 Self-test: {n_ok} of {len(res)} checks passed" if not n_fail else
+             f"🧪 Self-test: {n_fail} problem(s) found")
+    embed = {"title": title, "description": "\n".join(lines)[:4000],
+             "color": GREEN if not n_fail else RED}
+    print(title)
+    for ln in lines:
+        print(ln)
+    url = os.getenv("DISCORD_WEBHOOK_URL")
+    if url:
+        try:
+            r = requests.post(url, json={"embeds": [embed], "allowed_mentions": {"parse": []}}, timeout=20)
+            if r.status_code >= 300:
+                print(f"❌ Discord rejected the message (status {r.status_code}). Check the webhook link.")
+                n_fail += 1
+        except Exception as e:
+            print(f"❌ Could not reach Discord ({type(e).__name__}).")
+            n_fail += 1
+    if n_fail:
+        sys.exit(1)
+
+
 # --------------------------------- MAIN ---------------------------------
 def main():
     c = CFG
     if "--glossary" in sys.argv:
         post(embeds=[{"title": "📘 Beginner's glossary", "description": GLOSSARY, "color": BLUE}])
+        return
+
+    if "--selftest" in sys.argv:
+        run_selftest()
+        return
+
+    # ---- commands (laptop: python scanner.py --analyze NVDA | --news NVDA | --add AAPL | --remove AAPL;
+    #      GitHub: the Run workflow boxes fill in the same things)
+    add_t = os.getenv("WATCH_ADD", "") + " " + " ".join(cli_args("--add"))
+    rem_t = os.getenv("WATCH_REMOVE", "") + " " + " ".join(cli_args("--remove"))
+    if add_t.strip() or rem_t.strip():
+        update_watchlist(add_t, rem_t)
+        return
+    news_t = tokens(os.getenv("NEWS_TICKERS", "") + " " + " ".join(cli_args("--news")))
+    if news_t:
+        run_news(news_t[:10])
+        return
+    want = tokens(os.getenv("ANALYZE_TICKERS", "") + " " + " ".join(cli_args("--analyze")))
+    if want:
+        run_analysis(want[:10])
         return
 
     now_et = pd.Timestamp.now(tz="America/New_York")
@@ -517,10 +929,18 @@ def main():
     partial = (manual and spy_date == now_et.date() and now_et.weekday() < 5
                and (now_et.hour < 16 or (now_et.hour == 16 and now_et.minute < 10)))
 
-    tickers = get_universe()
-    print(f"Scanning {len(tickers)} tickers...")
+    # optional lists (files in the repository): watchlist.txt = your own stocks (always checked, even if cheap or
+    # quiet), exclude.txt = never scan these
+    watch = load_tickers(WATCH_FILE)
+    watch_set = set(watch)
+    exclude = set(load_tickers("exclude.txt"))
+    watch_mode = bool(watch)
+    only = watch_mode and c["watchlist_only"]
+    tickers = watch if only else list(dict.fromkeys(watch + [t for t in get_universe() if t not in exclude]))
+    print(f"Scanning {len(tickers)} tickers" + (f" (including {len(watch)} on your watchlist)" if watch_mode else "") + "...")
 
     cands, near, blocked = [], [], []
+    st = {}
     scanned = passed = 0
     for k in range(0, len(tickers), c["chunk"]):
         chunk = tickers[k:k + c["chunk"]]
@@ -530,7 +950,9 @@ def main():
             try:
                 x = build(df)
                 last = x.iloc[-1]
-                if not (last["c"] >= c["min_price"] and last["vol_avg"] >= c["min_avg_volume"]):
+                if t in watch_set:
+                    st[t] = status_text(last)
+                elif not (last["c"] >= c["min_price"] and last["vol_avg"] >= c["min_avg_volume"]):
                     continue
                 passed += 1
                 if last["long_setup"] and last["stop_long"] < last["c"]:
@@ -594,13 +1016,22 @@ def main():
         if len(near_show) >= c["max_watch_shown"]:
             break
 
+    if watch_mode:
+        for r in results:
+            st[r["ticker"]] = f"✅ BUY setup, grade {r['grade']} (score {r['score']:.0f}/100)"
+        for t, d, why in blocked:
+            st[t] = f"⛔ setup found but blocked: {why}"
+        for t in watch:
+            st.setdefault(t, "no data found (check the symbol, e.g. BRK-B)")
+
     # ---- report
     mood = ("🟢 Uptrend. Conditions are good for buying." if spy == "UP"
             else "🔴 Downtrend. Buy signals are blocked to protect you." if spy == "DOWN"
             else "⚪ Unknown")
     header = (f"📊 **Daily scan: {now_et.strftime('%a %d %b %Y')}**\n"
               f"Market mood (S&P 500): {mood}\n"
-              f"Checked **{scanned:,}** US stocks → **{passed:,}** liquid enough → "
+              + (f"Checked **{scanned:,}** stocks from your watchlist → " if only else
+                 f"Checked **{scanned:,}** US stocks → **{passed:,}** liquid enough → ") +
               f"**{len(results)}** trade setup(s), **{len(near_show)}** almost ready, "
               f"**{len(blocked)}** blocked by safety checks.")
     if partial:
@@ -617,6 +1048,9 @@ def main():
         post(embeds=[watch_embed(near_show)])
     if blocked:
         post(embeds=[blocked_embed(blocked[:c["max_blocked_shown"]])])
+    if watch_mode:
+        rows = [f"• **{t}**: {st[t]}" for t in watch][:60]
+        post(embeds=[{"title": "📋 Your watchlist today", "description": "\n".join(rows)[:4000], "color": BLUE}])
 
     if results:
         os.makedirs("results", exist_ok=True)
