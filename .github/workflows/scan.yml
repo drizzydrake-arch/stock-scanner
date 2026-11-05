@@ -86,6 +86,8 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RECORD: ${{ inputs.record }}
           COMPARE: ${{ inputs.compare }}
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ACCURACY: ${{ inputs.accuracy }}
           ANALYZE_TICKERS: ${{ inputs.analyze }}
           NEWS_TICKERS: ${{ inputs.news }}
