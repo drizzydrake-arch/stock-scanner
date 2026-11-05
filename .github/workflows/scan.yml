@@ -5,6 +5,7 @@ name: Daily stock scan
 # requirements.txt, and posts a pass/fail report to Discord.
 # You can also tap "Run workflow" (Actions tab) and fill in ONE box to give the bot a command:
 #   selftest     = test that everything works (about 1 minute)
+#   overview     = market mood, when moves might stop, best stocks to long and short (daily/weekly/monthly)
 #   record       = the bot's REAL track record (every trade it recommended, followed to the end)
 #   compare      = STRATEGY LAB: tests possible improvements and shows which really help
 #   accuracy     = replay the strategy over 5 years and show win rate and profit in percent
@@ -18,6 +19,8 @@ on:
   schedule:
     # 22:00 UTC, Monday to Friday (after the US market closes)
     - cron: "0 22 * * 1-5"
+    # 22:30 UTC weekdays: market overview (daily, plus weekly on Fridays and monthly on the last trading day)
+    - cron: "30 22 * * 1-5"
   push:
     paths:
       - "scanner.py"
@@ -29,6 +32,10 @@ on:
         description: "TEST the bot: checks prices, Discord and every feature (about 1 minute)"
         type: boolean
         default: false
+      overview:
+        description: "MARKET OVERVIEW: type daily, weekly or monthly (market mood, when moves might stop, best longs and shorts)"
+        type: string
+        default: ""
       record:
         description: "TRACK RECORD: show how accurate the bot's real recommendations have been so far"
         type: boolean
@@ -84,6 +91,8 @@ jobs:
       - name: Run scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OVERVIEW: ${{ inputs.overview }}
+          CRON: ${{ github.event.schedule }}
           RECORD: ${{ inputs.record }}
           COMPARE: ${{ inputs.compare }}
           ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
@@ -99,6 +108,8 @@ jobs:
         run: |
           if [ "$GLOSSARY" = "true" ]; then
             python scanner.py --glossary
+          elif [ "$CRON" = "30 22 * * 1-5" ]; then
+            python scanner.py --overview auto
           elif [ "$SELFTEST" = "true" ] || [ "$EVENT" = "push" ]; then
             python scanner.py --selftest
           else
