@@ -6,6 +6,7 @@ name: Daily stock scan
 # You can also tap "Run workflow" (Actions tab) and fill in ONE box to give the bot a command:
 #   selftest     = test that everything works (about 1 minute)
 #   record       = the bot's REAL track record (every trade it recommended, followed to the end)
+#   compare      = STRATEGY LAB: tests possible improvements and shows which really help
 #   accuracy     = replay the strategy over 5 years and show win rate and profit in percent
 #   analyze      = full analysis of one or more stocks (with news)
 #   news         = latest headlines only
@@ -32,6 +33,10 @@ on:
         description: "TRACK RECORD: show how accurate the bot's real recommendations have been so far"
         type: boolean
         default: false
+      compare:
+        description: "STRATEGY LAB: type yes to test 13 possible improvements side by side (takes 10 to 20 minutes)"
+        type: string
+        default: ""
       accuracy:
         description: "ACCURACY test (5 years, in percent): type yes for a big random sample, or tickers e.g. NVDA AAPL"
         type: string
@@ -80,6 +85,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RECORD: ${{ inputs.record }}
+          COMPARE: ${{ inputs.compare }}
           ACCURACY: ${{ inputs.accuracy }}
           ANALYZE_TICKERS: ${{ inputs.analyze }}
           NEWS_TICKERS: ${{ inputs.news }}
