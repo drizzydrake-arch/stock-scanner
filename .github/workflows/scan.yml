@@ -5,6 +5,7 @@ name: Daily stock scan
 # requirements.txt, and posts a pass/fail report to Discord.
 # You can also tap "Run workflow" (Actions tab) and fill in ONE box to give the bot a command:
 #   selftest     = test that everything works (about 1 minute)
+#   record       = the bot's REAL track record (every trade it recommended, followed to the end)
 #   accuracy     = replay the strategy over 5 years and show win rate and profit in percent
 #   analyze      = full analysis of one or more stocks (with news)
 #   news         = latest headlines only
@@ -25,6 +26,10 @@ on:
     inputs:
       selftest:
         description: "TEST the bot: checks prices, Discord and every feature (about 1 minute)"
+        type: boolean
+        default: false
+      record:
+        description: "TRACK RECORD: show how accurate the bot's real recommendations have been so far"
         type: boolean
         default: false
       accuracy:
@@ -74,6 +79,7 @@ jobs:
       - name: Run scanner
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RECORD: ${{ inputs.record }}
           ACCURACY: ${{ inputs.accuracy }}
           ANALYZE_TICKERS: ${{ inputs.analyze }}
           NEWS_TICKERS: ${{ inputs.news }}
@@ -91,13 +97,14 @@ jobs:
             python scanner.py
           fi
 
-      - name: Save watchlist changes
-        if: ${{ inputs.watch_add != '' || inputs.watch_remove != '' }}
+      - name: Save watchlist and trade journal
+        if: ${{ github.event_name != 'push' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add watchlist.txt
-          git diff --cached --quiet || git commit -m "Update watchlist"
+          git add watchlist.txt 2>/dev/null || true
+          git add trades_log.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update watchlist and trade journal"
           git push
 
       - name: Save results
