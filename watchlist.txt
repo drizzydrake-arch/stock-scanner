@@ -1,0 +1,8 @@
+# Your watchlist: one ticker per line. Edit here, or use the Run workflow buttons.
+IREN
+NBIS
+CRWV
+APLD
+CIFR
+GOOG
+MU
